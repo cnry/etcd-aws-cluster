@@ -38,6 +38,12 @@ if [[ ! $asg_name ]]; then
     exit 4
 fi
 
+capacity=$(aws autoscaling describe-auto-scaling-groups --region $region --auto-scaling-group-names="$asg_name" | jq --raw-output ".[] | .[].DesiredCapacity")
+if [[ $capacity == 'null' ]]; then
+    echo "$pkg: failed to get the auto scaling group DesiredCapacity for $asg_name"
+    exit 5
+fi
+
 etcd_client_scheme=${ETCD_CLIENT_SCHEME:-http}
 echo "client_client_scheme=$etcd_client_scheme"
 
@@ -45,10 +51,17 @@ etcd_peer_urls=$(aws ec2 describe-instances --region $region --instance-ids $(aw
 
 if [[ ! $etcd_peer_urls ]]; then
     echo "$pkg: unable to find members of auto scaling group"
-    exit 5
+    exit 6
 fi
 
 echo "etcd_peer_urls=$etcd_peer_urls"
+
+urls() { echo $#; }
+peers="$(urls $etcd_peer_urls)"
+if [[ $peers < $capacity ]]; then
+    echo "$pkg: there are $peers < $capacity members of auto scaling group InService"
+    exit 7
+fi
 
 etcd_existing_peer_urls=
 etcd_existing_peer_names=
@@ -82,7 +95,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
     peer_regexp=$(echo "$etcd_peer_urls" | sed 's/^.*https\{0,1\}:\/\/\([0-9.]*\):[0-9]*.*$/contains(\\"\/\/\1:\\")/' | xargs | sed 's/  */ or /g')
     if [[ ! $peer_regexp ]]; then
         echo "$pkg: failed to create peer regular expression"
-        exit 6
+        exit 8
     fi
 
     echo "peer_regexp=$peer_regexp"
@@ -95,7 +108,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
             status=$(curl $ETCD_CURLOPTS -f -s -w %{http_code} "$etcd_good_member_url/v2/members/$bp" -XDELETE)
             if [[ $status != $delete_ok ]]; then
                 echo "$pkg: ERROR: failed to remove bad peer: $bad_peer, return code $status."
-                exit 7
+                exit 9
             fi
         done
     fi
@@ -104,7 +117,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
     echo "etcd_initial_cluster=$etcd_initial_cluster"
     if [[ ! $etcd_initial_cluster ]]; then
         echo "$pkg: docker command to get etcd peers failed"
-        exit 8
+        exit 10
     fi
 
     # join an existing cluster
@@ -112,7 +125,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
     status=$(curl $ETCD_CURLOPTS -f -s -w %{http_code} -o /dev/null -XPOST "$etcd_good_member_url/v2/members" -H "Content-Type: application/json" -d "{\"peerURLs\": [\"http://$ec2_instance_ip:2380\"], \"name\": \"$ec2_instance_id\"}")
     if [[ $status != $add_ok && $status != $already_added ]]; then
         echo "$pkg: unable to add $ec2_instance_ip to the cluster: return code $status."
-    	exit 9
+        exit 11
     fi
 
     cat > "$etcd_peers_file_path" <<EOF
@@ -129,7 +142,7 @@ else
     echo "etcd_initial_cluster=$etcd_initial_cluster"
     if [[ ! $etcd_initial_cluster ]]; then
         echo "$pkg: unable to get peers from auto scaling group"
-        exit 10
+        exit 12
     fi
 
     cat > "$etcd_peers_file_path" <<EOF
